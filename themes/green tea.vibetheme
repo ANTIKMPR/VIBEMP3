@@ -1,0 +1,18 @@
+# Тема VIBEMP3 — можно редактировать вручную
+name = green tea
+
+bg = 38,37,44
+panel = 55,54,60
+text = 230,230,235
+text_dim = 143,143,149
+accent = 116,158,127
+progress_bg = 70,69,75
+progress_fill = 116,158,127
+button_small_bg = 59,58,65
+button_small_border = 81,80,86
+row_current = 57,67,64
+row_hover = 55,54,60
+error = 200,60,60
+success = 60,160,90
+remove_x = 220,90,90
+viz_wave = 101,134,105

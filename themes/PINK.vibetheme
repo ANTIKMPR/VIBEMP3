@@ -1,0 +1,18 @@
+# Тема VIBEMP3 — можно редактировать вручную
+name = PINK
+
+bg = 36,18,27
+panel = 53,36,45
+text = 117,39,70
+text_dim = 80,29,50
+accent = 255,44,125
+progress_bg = 68,53,61
+progress_fill = 255,44,125
+button_small_bg = 57,41,49
+button_small_border = 79,65,72
+row_current = 90,24,51
+row_hover = 53,36,45
+error = 200,60,60
+success = 60,160,90
+remove_x = 220,90,90
+viz_wave = 180,50,255

@@ -1,0 +1,18 @@
+# Тема VIBEMP3 — можно редактировать вручную
+name = OLED
+
+bg = 0,0,0
+panel = 20,20,20
+text = 255,255,255
+text_dim = 140,140,140
+accent = 110,110,110
+progress_bg = 38,38,38
+progress_fill = 110,110,110
+button_small_bg = 25,25,25
+button_small_border = 51,51,51
+row_current = 27,27,27
+row_hover = 20,20,20
+error = 200,60,60
+success = 60,160,90
+remove_x = 220,90,90
+viz_wave = 107,107,124

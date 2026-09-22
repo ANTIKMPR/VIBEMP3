@@ -22,6 +22,8 @@ from theme_transition import ThemeTransition
 import logo_theme
 import app_font
 import button_icons
+import camera_shake
+import vibesync_background
 import ui
 
 
@@ -157,8 +159,14 @@ def pick_files() -> list[str]:
     root.withdraw()
     root.attributes("-topmost", True)
     files = filedialog.askopenfilenames(
-        title="Выбери mp3-файлы",
-        filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")],
+        title="Выбери аудиофайлы или VIBE-SYNC пакеты (.zip)",
+        filetypes=[
+            ("Аудио и VIBE-SYNC", "*.mp3 *.ogg *.zip"),
+            ("MP3 files", "*.mp3"),
+            ("OGG files", "*.ogg"),
+            ("VIBE-SYNC пакеты", "*.zip"),
+            ("All files", "*.*"),
+        ],
     )
     root.destroy()
     return list(files)
@@ -174,7 +182,12 @@ def main():
         pygame.display.set_icon(icon_surface)
 
     pygame.display.set_caption(APP_NAME)
-    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    real_screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    # Кадр сначала рисуется на отдельной поверхности (screen), а не прямо на
+    # дисплее — это позволяет применить общий сдвиг всего кадра (эффект
+    # "удара камеры" из VIBE-SYNC, см. camera_shake.py) одним финальным
+    # блитом, не трогая десятки мест по всему циклу, которые рисуют на screen.
+    screen = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
     clock = pygame.time.Clock()
 
     font = app_font.get_font(BASE_DIR, 16)
@@ -183,7 +196,7 @@ def main():
     font_logo_fallback = app_font.get_font(BASE_DIR, 30, bold=True)  # если BigLogo.png не найден
     font_transport = pick_symbol_font(20)  # для ▶/⏸ — кастомный шрифт их не содержит, нужен системный
 
-    engine = AudioEngine()
+    engine = AudioEngine(base_dir=BASE_DIR)
     toast = ui.Toast()
 
     settings = Settings(BASE_DIR)
@@ -192,8 +205,18 @@ def main():
     engine.repeat_mode = settings.repeat_mode  # восстанавливаем режим повтора
     engine.set_crossfade_sec(settings.crossfade_sec)  # применяем сохранённое время кроссфейда
 
+    cam_shake = camera_shake.CameraShake()
+    vibesync_bg = vibesync_background.VibeSyncBackground()
+
     settings_panel = SettingsPanel()
     theme_transition = ThemeTransition()
+
+    # VIBE-SYNC: отдельный переход (независимый от theme_transition выше,
+    # который отвечает за смену темы в настройках) — плавно вводит/выводит
+    # временную тему трека, если у него в sync.json заданы theme-цвета.
+    vibesync_theme_transition = ThemeTransition()
+    vibesync_theme_active_pkg = None       # какой VIBE-SYNC пакет считается "активным" для темы прямо сейчас
+    vibesync_theme_last_palette = settings.palette()  # последняя реально применённая палитра — стартовая точка для перехода
 
     # Логотип грузим после set_mode (convert_alpha() требует созданный дисплей)
     # и после загрузки settings — под сохранённую тему сразу подставляется
@@ -210,6 +233,17 @@ def main():
     # Восстанавливаем плейлист из последней запомненной папки, если она ещё существует
     if settings.last_folder and os.path.isdir(settings.last_folder):
         engine.load_folder(settings.last_folder)
+
+    # Восстанавливаем отдельные файлы, добавленные через "+ Файлы" (mp3/ogg
+    # и VIBE-SYNC .zip пакеты) — add_files сам распакует .zip заново, если
+    # нужно (кэш VIBE-SYNC уже лежит на диске, повторно не распаковывается).
+    # Пропавшие с диска файлы просто тихо не добавляются, а не роняют старт.
+    if settings.last_files:
+        existing_files = [p for p in settings.last_files if os.path.isfile(p)]
+        if existing_files:
+            engine.add_files(existing_files)
+        if existing_files != settings.last_files:
+            settings.set_last_files(existing_files)  # подчищаем список от исчезнувших файлов
 
     # --- Разметка UI (сверху вниз) ---
 
@@ -307,6 +341,7 @@ def main():
             toast.show(str(e), is_error=True)
 
     while running:
+        _frame_t0 = pygame.time.get_ticks()
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
@@ -375,6 +410,14 @@ def main():
                     added = engine.add_files(files)
                     if added > 0:
                         toast.show(settings.t("added_tracks", n=added))
+                        # Запоминаем исходные пути (включая .zip VIBE-SYNC
+                        # пакеты как есть, не распакованные) — при следующем
+                        # запуске add_files() снова сам распакует/подхватит их.
+                        merged = list(settings.last_files)
+                        for f in files:
+                            if f not in merged:
+                                merged.append(f)
+                        settings.set_last_files(merged)
                         if engine.current_index == -1:
                             try_play_index(0)
                     else:
@@ -384,6 +427,7 @@ def main():
                 if engine.has_tracks():
                     engine.clear_playlist()
                     settings.set_last_folder(None)
+                    settings.set_last_files([])
                     visualizer.values[:] = 0
                     toast.show(settings.t("playlist_cleared"))
 
@@ -422,7 +466,9 @@ def main():
             if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if dragging_progress and engine.current_track:
                     ratio = progress_bar.get_ratio_from_click(mouse_pos[0])
-                    engine.seek(ratio * engine.current_track.duration_sec)
+                    seek_pos = ratio * engine.current_track.duration_sec
+                    engine.seek(seek_pos)
+                    cam_shake.notify_seek(seek_pos)  # чтобы не отыгрывать пропущенные удары разом
                 dragging_progress = False
                 dragging_volume = False
 
@@ -433,7 +479,17 @@ def main():
                 if kind == "play":
                     try_play_index(idx)
                 elif kind == "remove":
+                    removed_path = engine.playlist[idx] if 0 <= idx < len(engine.playlist) else None
                     engine.remove_index(idx)
+                    if removed_path:
+                        # Если это был VIBE-SYNC трек — из last_files нужно
+                        # убрать исходный .zip, а не распакованный путь
+                        # (engine.playlist хранит путь внутри vibesync_cache,
+                        # а last_files — то, что реально выбрал пользователь).
+                        pkg = engine.get_vibesync_package(removed_path)
+                        forget_path = pkg.zip_path if pkg is not None else removed_path
+                        if forget_path in settings.last_files:
+                            settings.set_last_files([p for p in settings.last_files if p != forget_path])
 
         # Живое перетаскивание слайдера громкости (обновляется каждый кадр, пока зажата кнопка)
         if dragging_volume:
@@ -487,6 +543,23 @@ def main():
         if engine.current_index >= 0:
             track_list.ensure_visible(engine.current_index, len(engine.playlist))
 
+        # VIBE-SYNC: если текущий трек пришёл из .zip-пакета — продвигаем
+        # тряску камеры по camera_hits (если заданы) и обновляем фон (видео/
+        # параллакс-обложка) под этот пакет. Если трек обычный — оба
+        # состояния сбрасываются, чтобы не "тряслось"/не показывался старый
+        # фон по инерции от прошлого VIBE-SYNC трека.
+        active_vibesync_pkg = None
+        if engine.current_track is not None:
+            active_vibesync_pkg = engine.get_vibesync_package(engine.current_track.filepath)
+
+        if active_vibesync_pkg is not None and active_vibesync_pkg.has_camera_hits:
+            cam_shake.set_hits(active_vibesync_pkg.camera_hits, track_key=engine.current_track.filepath)
+            cam_shake.update(engine.get_position_sec())
+        else:
+            cam_shake.clear()
+
+        vibesync_bg.set_package(active_vibesync_pkg, (WINDOW_WIDTH, WINDOW_HEIGHT))
+
         # --- Обновление данных визуализации ---
         if engine.current_track and not engine.is_paused():
             fft_bins = engine.get_fft_bins(num_bins=48)
@@ -497,8 +570,37 @@ def main():
         # --- Отрисовка ---
         # Во время анимации перехода темы палитра плавно интерполируется между
         # старыми и новыми цветами; вне анимации это просто settings.palette().
-        palette = theme_transition.get_palette(settings.palette())
+        base_palette = theme_transition.get_palette(settings.palette())
+
+        # VIBE-SYNC: если у текущего трека есть переопределения цветов темы
+        # (sync.json -> "theme"), накладываем их поверх обычной палитры —
+        # только заданные ключи (bg/accent/text), остальное остаётся как в
+        # активной теме пользователя. Плавность перехода в/из VIBE-SYNC
+        # обеспечивает отдельный vibesync_theme_transition (не тот же самый
+        # theme_transition, что отвечает за обычную смену темы в настройках)
+        # — так два независимых источника анимации не конфликтуют.
+        # active_vibesync_pkg уже вычислен выше (для camera_shake/фона) —
+        # переиспользуем его, чтобы не искать по словарю дважды за кадр.
+        target_palette = dict(base_palette)
+        if active_vibesync_pkg is not None and active_vibesync_pkg.has_theme_override:
+            target_palette.update(active_vibesync_pkg.theme_overrides)
+
+        if active_vibesync_pkg is not vibesync_theme_active_pkg:
+            vibesync_theme_transition.start(dict(vibesync_theme_last_palette), target_palette)
+            vibesync_theme_active_pkg = active_vibesync_pkg
+        vibesync_theme_last_palette = target_palette
+
+        palette = vibesync_theme_transition.get_palette(target_palette)
         screen.fill(palette["bg"])
+
+        # VIBE-SYNC: фон (видео зацикленное, или параллакс-обложка) рисуется
+        # поверх заливки цветом — если фона нет, ничего не меняется.
+        if vibesync_bg.has_background:
+            vibesync_bg.draw_background(
+                screen, mouse_pos,
+                track_position_sec=engine.get_position_sec(),
+                is_paused=engine.is_paused(),
+            )
 
         # Логотип (или текстовый фолбэк, если файл не найден)
         if logo_surface is not None:
@@ -532,15 +634,24 @@ def main():
         time_surf = font_small.render(f"{pos_text} / {dur_text}", True, palette["text_dim"])
         screen.blit(time_surf, (30, time_y))
 
+        # VIBE-SYNC: маленькая обложка рядом с названием — показывается,
+        # только когда у трека есть видео-фон (иначе обложка сама уже фон,
+        # дублировать её маленькой копией рядом с текстом не нужно).
+        title_x = 30
+        if vibesync_bg.has_small_cover:
+            cover_pos = (30, title_y - 4)
+            vibesync_bg.draw_small_cover(screen, cover_pos, palette)
+            title_x = 30 + 44 + 12  # ширина обложки (44) + отступ
+
         title = engine.current_track.title if engine.current_track else settings.t("no_track")
         title_surf = font_title.render(title, True, palette["text"])
         # Обрезаем заголовок, если он шире окна, чтобы не вылезал за край
-        max_title_width = WINDOW_WIDTH - 60
+        max_title_width = WINDOW_WIDTH - 30 - title_x
         if title_surf.get_width() > max_title_width:
             while title and font_title.size(title + "…")[0] > max_title_width:
                 title = title[:-1]
             title_surf = font_title.render(title + "…", True, palette["text"])
-        screen.blit(title_surf, (30, title_y))
+        screen.blit(title_surf, (title_x, title_y))
 
         is_playing = bool(engine.current_track and not engine.is_paused())
         btn_play.label = "⏸" if is_playing else "▶"
@@ -589,7 +700,25 @@ def main():
             player_snapshot = screen.copy()
             settings_panel.draw(screen, mouse_pos, settings, palette, background_snapshot=player_snapshot)
 
+        # Финальный блит кадра на реальный дисплей — с масштабированием
+        # (приближение/отдаление) от "удара камеры" VIBE-SYNC, если он
+        # сейчас активен (иначе scale == 1.0 и это обычный блит без эффекта).
+        # Масштабирование идёт вокруг центра экрана; края, оголившиеся при
+        # zoom-out (scale < 1), заливаем цветом фона текущей темы.
+        shake_scale = cam_shake.scale
+        if shake_scale != 1.0:
+            scaled_w = round(WINDOW_WIDTH * shake_scale)
+            scaled_h = round(WINDOW_HEIGHT * shake_scale)
+            scaled_frame = pygame.transform.scale(screen, (scaled_w, scaled_h))  # обычный scale (без smoothing) — быстрее, а для короткого эффекта разница в качестве незаметна
+            real_screen.fill(palette["bg"])
+            real_screen.blit(scaled_frame, ((WINDOW_WIDTH - scaled_w) // 2, (WINDOW_HEIGHT - scaled_h) // 2))
+        else:
+            real_screen.blit(screen, (0, 0))
+
         pygame.display.flip()
+        _frame_elapsed = pygame.time.get_ticks() - _frame_t0
+        if _frame_elapsed > 33:  # дольше, чем бюджет 30fps — подозрительно
+            print(f"[VIBEMP3][perf] SLOW FRAME: {_frame_elapsed}ms")
         clock.tick(FPS)
 
     settings.save()

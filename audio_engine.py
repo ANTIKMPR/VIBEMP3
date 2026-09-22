@@ -42,6 +42,16 @@ if sys.platform == "win32":
 
 from pydub import AudioSegment
 
+from vibesync import (
+    load_package as load_vibesync_package,
+    is_vibesync_package,
+    VibeSyncPackageError,
+    VibeSyncPackage,
+)
+
+
+SUPPORTED_AUDIO_EXTENSIONS = (".mp3", ".ogg")
+
 try:
     from mutagen import File as mutagen_File
     from mutagen.id3 import ID3, APIC
@@ -52,9 +62,14 @@ except ImportError:
 
 def read_track_metadata(filepath: str) -> dict:
     """
-    Читает ID3-метаданные mp3-файла через mutagen: название, исполнитель,
-    альбом, сырые байты обложки (если есть). Не декодирует аудио — быстрая
-    операция, отдельная от полной PCM-декодировки в Track.
+    Читает метаданные аудиофайла (mp3/ogg) через mutagen: название,
+    исполнитель, альбом, сырые байты обложки (если есть). Не декодирует
+    аудио — быстрая операция, отдельная от полной PCM-декодировки в Track.
+
+    mp3 использует теги ID3v2 (TIT2/TPE1/TALB/APIC), а ogg — Vorbis Comments
+    (простые title/artist/album, plain-текстовые, без ID3-префиксов) плюс
+    обложка в METADATA_BLOCK_PICTURE (base64 FLAC-picture блок). Форматы
+    достаточно разные, что читаем их отдельными ветками по расширению.
 
     Всегда возвращает словарь с этими ключами, даже если mutagen недоступен
     или файл без тегов — тогда title подставляется из имени файла, а
@@ -67,29 +82,72 @@ def read_track_metadata(filepath: str) -> dict:
     if not _MUTAGEN_AVAILABLE:
         return result
 
+    is_ogg = filepath.lower().endswith(".ogg")
+
     try:
         audio = mutagen_File(filepath)
         if audio is None:
             return result
 
         tags = audio.tags
-        if tags is not None:
-            # ID3v2 хранит текстовые теги как объекты с .text (список строк)
-            if "TIT2" in tags:
-                result["title"] = str(tags["TIT2"].text[0]) or fallback_title
-            if "TPE1" in tags:
-                result["artist"] = str(tags["TPE1"].text[0]) or None
-            if "TALB" in tags:
-                result["album"] = str(tags["TALB"].text[0]) or None
+        if tags is None:
+            return result
 
-            # Обложка лежит в APIC-фрейме(ах); берём первую найденную
-            for key in tags.keys():
-                if key.startswith("APIC"):
-                    result["cover_bytes"] = tags[key].data
-                    break
+        if is_ogg:
+            _read_vorbis_comment_tags(tags, result, fallback_title)
+        else:
+            _read_id3_tags(tags, result, fallback_title)
     except Exception as e:
         print(f"[VIBEMP3] Не удалось прочитать метаданные ({filepath}): {e}")
 
+    return result
+
+
+def _read_id3_tags(tags, result: dict, fallback_title: str):
+    """Заполняет result из ID3v2-тегов (mp3): TIT2/TPE1/TALB/APIC."""
+    if "TIT2" in tags:
+        result["title"] = str(tags["TIT2"].text[0]) or fallback_title
+    if "TPE1" in tags:
+        result["artist"] = str(tags["TPE1"].text[0]) or None
+    if "TALB" in tags:
+        result["album"] = str(tags["TALB"].text[0]) or None
+
+    # Обложка лежит в APIC-фрейме(ах); берём первую найденную
+    for key in tags.keys():
+        if key.startswith("APIC"):
+            result["cover_bytes"] = tags[key].data
+            break
+
+
+def _read_vorbis_comment_tags(tags, result: dict, fallback_title: str):
+    """
+    Заполняет result из Vorbis Comment тегов (ogg): простые title/artist/album
+    (каждый — список строк, mutagen отдаёт их через обычный dict-подобный
+    доступ), обложка — из METADATA_BLOCK_PICTURE (FLAC-picture, base64).
+    """
+    def first_value(key: str) -> str | None:
+        values = tags.get(key)
+        return values[0] if values else None
+
+    title = first_value("title")
+    if title:
+        result["title"] = title
+    artist = first_value("artist")
+    if artist:
+        result["artist"] = artist
+    album = first_value("album")
+    if album:
+        result["album"] = album
+
+    picture_b64 = first_value("metadata_block_picture")
+    if picture_b64:
+        try:
+            from mutagen.flac import Picture
+            import base64
+            picture = Picture(base64.b64decode(picture_b64))
+            result["cover_bytes"] = picture.data
+        except Exception:
+            pass  # битый/нестандартный блок картинки — просто остаёмся без обложки
     return result
 
 
@@ -105,11 +163,13 @@ class Track:
         self.album = meta["album"]
         self.cover_bytes = meta["cover_bytes"]
 
-        # Декодируем mp3 в PCM через pydub (использует ffmpeg под капотом).
+        # Декодируем аудио в PCM через pydub (использует ffmpeg под капотом).
+        # from_file (а не from_mp3) сам определяет формат по расширению —
+        # так один и тот же код декодирует и mp3, и ogg без ветвления.
         # Заворачиваем в понятную ошибку, чтобы GUI мог показать её пользователю,
         # а не упасть молча (частые причины: нет ffmpeg в PATH, битый файл).
         try:
-            segment = AudioSegment.from_mp3(filepath)
+            segment = AudioSegment.from_file(filepath)
         except Exception as e:
             raise RuntimeError(
                 f"Не удалось декодировать '{self.title}'.\n"
@@ -175,7 +235,7 @@ class AudioEngine:
 
     NUM_CHANNELS = 2
 
-    def __init__(self):
+    def __init__(self, base_dir: str | None = None):
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
         pygame.mixer.set_num_channels(self.NUM_CHANNELS)
 
@@ -203,6 +263,13 @@ class AudioEngine:
 
         self._metadata_cache: dict[str, dict] = {}  # filepath -> {title, artist, album, cover_bytes}
 
+        # VIBE-SYNC: путь распакованного аудио -> VibeSyncPackage. Плейлист
+        # хранит обычные пути к аудиофайлам (распакованным из .zip), а этот
+        # словарь позволяет main.py узнать, что для конкретного трека есть
+        # ещё и обложка/видео/временная тема, когда он станет текущим.
+        self.base_dir = base_dir
+        self.vibesync_map: dict[str, "VibeSyncPackage"] = {}
+
     def get_metadata(self, filepath: str) -> dict:
         """
         Возвращает лёгкие метаданные файла (без полной PCM-декодировки,
@@ -214,6 +281,10 @@ class AudioEngine:
             self._metadata_cache[filepath] = read_track_metadata(filepath)
         return self._metadata_cache[filepath]
 
+    def get_vibesync_package(self, filepath: str):
+        """Возвращает VibeSyncPackage для трека, если он был добавлен из .zip, иначе None."""
+        return self.vibesync_map.get(filepath)
+
     def set_crossfade_sec(self, seconds: float):
         """Устанавливает длительность кроссфейда между треками (в секундах). 0 = мгновенное переключение."""
         self.crossfade_sec = max(0.0, seconds)
@@ -221,19 +292,19 @@ class AudioEngine:
     # ---------- Управление плейлистом ----------
 
     def load_folder(self, folder_path: str):
-        """Загружает все mp3-файлы из папки в плейлист (заменяет текущий плейлист)."""
+        """Загружает все аудиофайлы (mp3/ogg) из папки в плейлист (заменяет текущий плейлист)."""
         files = sorted(
             f for f in os.listdir(folder_path)
-            if f.lower().endswith(".mp3")
+            if f.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS)
         )
         self.playlist = [os.path.join(folder_path, f) for f in files]
         self.current_index = -1
 
     def add_folder(self, folder_path: str) -> int:
-        """Добавляет все mp3 из папки в конец текущего плейлиста. Возвращает число добавленных файлов."""
+        """Добавляет все аудиофайлы (mp3/ogg) из папки в конец текущего плейлиста. Возвращает число добавленных файлов."""
         files = sorted(
             f for f in os.listdir(folder_path)
-            if f.lower().endswith(".mp3")
+            if f.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS)
         )
         added = [os.path.join(folder_path, f) for f in files]
         # Не дублируем уже добавленные пути
@@ -242,14 +313,33 @@ class AudioEngine:
         return len(added)
 
     def add_files(self, filepaths: list[str]) -> int:
-        """Добавляет отдельные mp3-файлы в конец плейлиста. Возвращает число добавленных файлов."""
+        """
+        Добавляет отдельные файлы в конец плейлиста. Понимает как обычные
+        аудиофайлы (mp3/ogg), так и VIBE-SYNC пакеты (.zip) — zip'ы
+        распаковываются на лету, а в плейлист попадает путь к аудио внутри
+        распакованного пакета (проигрывается как обычный трек, но main.py
+        может подхватить для него доп. фон/тему через get_vibesync_package).
+        Возвращает число добавленных файлов (успешных).
+        """
         added = []
         for p in filepaths:
-            # Проверяем и против уже имеющегося плейлиста, и против того, что
-            # уже отобрали в этом же вызове — иначе дубль внутри filepaths
-            # (например, пользователь выбрал один файл дважды) проскочит.
-            if p.lower().endswith(".mp3") and p not in self.playlist and p not in added:
+            if p in self.playlist or p in added:
+                continue  # тот же путь уже в плейлисте — пропускаем дубль
+
+            if is_vibesync_package(p):
+                try:
+                    package = load_vibesync_package(p, self.base_dir)
+                except VibeSyncPackageError as e:
+                    print(f"[VIBEMP3] VIBE-SYNC пакет пропущен ({p}): {e}")
+                    continue
+                audio_path = package.audio_path
+                if audio_path in self.playlist or audio_path in added:
+                    continue  # тот же трек уже добавлен (например, из другого .zip с тем же аудио)
+                self.vibesync_map[audio_path] = package
+                added.append(audio_path)
+            elif p.lower().endswith(SUPPORTED_AUDIO_EXTENSIONS):
                 added.append(p)
+
         self.playlist.extend(added)
         return len(added)
 
